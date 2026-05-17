@@ -1,0 +1,67 @@
+{{- if (index .Values "kube-prometheus-stack" "enabled") }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "openclaw.fullname" . }}-rules
+  labels:
+    app.kubernetes.io/name: {{ include "openclaw.fullname" . }}
+    # kube-prometheus-stack's Prometheus discovers PrometheusRules by
+    # matching its ruleSelector. Default is release={{ .Release.Name }}.
+    release: {{ .Release.Name }}
+spec:
+  groups:
+    - name: openclaw.gateway
+      rules:
+        - alert: OpenclawGatewayDown
+          expr: |
+            kube_deployment_status_replicas_available{
+              namespace="{{ .Release.Namespace }}",
+              deployment="{{ include "openclaw.fullname" . }}"
+            } == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "openclaw gateway has 0 available replicas"
+            description: "Deployment {{ "{{ $labels.deployment }}" }} in {{ "{{ $labels.namespace }}" }} has been unavailable for >5m. /readyz unreachable."
+
+        - alert: OpenclawGatewayCrashLooping
+          expr: |
+            rate(kube_pod_container_status_restarts_total{
+              namespace="{{ .Release.Namespace }}",
+              container="openclaw"
+            }[15m]) > 0.2
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "openclaw gateway container is restarting frequently"
+            description: "Pod {{ "{{ $labels.pod }}" }} container openclaw restart rate >0.2/s over 15m (≈3+ restarts in window)."
+
+    - name: openclaw.storage
+      rules:
+        - alert: OpenclawPVCNearFull
+          expr: |
+            (
+              kubelet_volume_stats_used_bytes{namespace="{{ .Release.Namespace }}"}
+              /
+              kubelet_volume_stats_capacity_bytes{namespace="{{ .Release.Namespace }}"}
+            ) > 0.85
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "openclaw PVC {{ "{{ $labels.persistentvolumeclaim }}" }} >85% full"
+            description: "{{ "{{ $labels.persistentvolumeclaim }}" }} in {{ "{{ $labels.namespace }}" }} is at {{ "{{ $value | humanizePercentage }}" }} of capacity. local-path PVs can't grow; clean up or migrate before this fills."
+
+    - name: openclaw.cluster
+      rules:
+        - alert: KubeNodeNotReady
+          expr: kube_node_status_condition{condition="Ready",status="true"} == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "node {{ "{{ $labels.node }}" }} is NotReady"
+            description: "Node has been NotReady for >5m. On the single-node k3s PoC, this means the gateway is unreachable."
+{{- end }}

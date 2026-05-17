@@ -1,0 +1,30 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: openclaw
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/YOUR_GITHUB_ORG/openclaw-k3s.git
+    # Pinned to a promoted commit. Bumped by scripts/promote-prod.sh
+    # via PR. Do NOT switch to a branch ref — see docs/RELIABILITY-PLAN.md
+    # for why tracking main HEAD is what auto-deployed the two
+    # seed-plugins outages.
+    targetRevision: bc73f553792dc9bf5f164379614314a0dbfd8235
+    path: chart/openclaw
+    plugin:
+      name: openclaw-helm-sops
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: openclaw
+  syncPolicy:
+    automated:
+      # prune deliberately omitted — see argocd/application.yaml for why.
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      # kube-prometheus-stack CRDs exceed the client-side apply annotation
+      # limit. Server-side apply avoids the 262144-byte metadata annotation
+      # failure during Argo syncs.
+      - ServerSideApply=true

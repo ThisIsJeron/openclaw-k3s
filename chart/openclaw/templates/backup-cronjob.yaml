@@ -1,0 +1,113 @@
+{{- if .Values.backup.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "openclaw.fullname" . }}-backup
+  labels:
+    app.kubernetes.io/name: {{ include "openclaw.fullname" . }}
+    app.kubernetes.io/component: backup
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 3600
+      template:
+        spec:
+          restartPolicy: Never
+          # Read-only mount of the openclaw PVC. The gateway pod has
+          # the same PVC mounted RW; on a single-node local-path setup
+          # both can attach because RWO is per-node.
+          containers:
+            - name: kopia
+              image: {{ .Values.backup.image | quote }}
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  : "${REPOSITORY:?repository URL not set}"
+                  : "${KOPIA_PASSWORD:?KOPIA_PASSWORD not set}"
+
+                  export KOPIA_CONFIG_PATH=/tmp/kopia.config
+                  export KOPIA_LOG_DIR=/tmp/kopia-logs
+                  export KOPIA_CACHE_DIRECTORY=/tmp/kopia-cache
+
+                  # Parse REPOSITORY URL into kopia's expected flags.
+                  case "$REPOSITORY" in
+                    s3://*)
+                      bucket_path="${REPOSITORY#s3://}"
+                      bucket="${bucket_path%%/*}"
+                      prefix="${bucket_path#*/}"
+                      [ "$prefix" = "$bucket" ] && prefix=""
+                      args="--bucket=$bucket"
+                      [ -n "$prefix" ] && args="$args --prefix=$prefix/"
+                      [ -n "${AWS_S3_ENDPOINT:-}" ] && args="$args --endpoint=$AWS_S3_ENDPOINT"
+                      kopia repository connect s3 $args 2>/dev/null \
+                        || kopia repository create s3 $args
+                      ;;
+                    *)
+                      echo "Unsupported repository URL: $REPOSITORY" >&2
+                      echo "Currently this CronJob only wires the s3:// scheme." >&2
+                      exit 2
+                      ;;
+                  esac
+
+                  # Take a snapshot
+                  kopia snapshot create /backup-source
+
+                  # Apply retention policy
+                  kopia policy set /backup-source \
+                    --keep-hourly={{ .Values.backup.retention.keepHourly }} \
+                    --keep-daily={{ .Values.backup.retention.keepDaily }} \
+                    --keep-weekly={{ .Values.backup.retention.keepWeekly }} \
+                    --keep-monthly={{ .Values.backup.retention.keepMonthly }}
+
+                  # Trigger maintenance to apply retention immediately
+                  kopia maintenance run --full || true
+
+                  kopia repository disconnect
+              env:
+                - name: REPOSITORY
+                  value: {{ .Values.backup.repository | quote }}
+                - name: KOPIA_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.backup.secretName | quote }}
+                      key: KOPIA_PASSWORD
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.backup.secretName | quote }}
+                      key: AWS_ACCESS_KEY_ID
+                      optional: true
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.backup.secretName | quote }}
+                      key: AWS_SECRET_ACCESS_KEY
+                      optional: true
+                - name: AWS_S3_ENDPOINT
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.backup.secretName | quote }}
+                      key: AWS_S3_ENDPOINT
+                      optional: true
+              volumeMounts:
+                - name: backup-source
+                  mountPath: /backup-source
+                  readOnly: true
+{{- with .Values.backup.resources }}
+              resources:
+{{ toYaml . | indent 16 }}
+{{- end }}
+          volumes:
+            - name: backup-source
+              persistentVolumeClaim:
+                claimName: {{ include "openclaw.fullname" . }}-state
+                readOnly: true
+{{- end }}

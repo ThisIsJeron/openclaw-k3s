@@ -1,0 +1,357 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "openclaw.fullname" . }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "openclaw.fullname" . }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+{{- if .Values.workspace.enabled }}
+        checksum/workspace: {{ include (print $.Template.BasePath "/workspace-configmap.yaml") . | sha256sum }}
+{{- end }}
+      labels:
+        app.kubernetes.io/name: {{ include "openclaw.fullname" . }}
+    spec:
+{{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+{{ toYaml . | indent 8 }}
+{{- end }}
+      initContainers:
+{{- if and .Values.gogcli.enabled (not .Values.image.bakedTools) }}
+        - name: install-gogcli
+          image: "{{ .Values.gogcli.image.repository }}{{- if .Values.gogcli.image.digest }}@{{ .Values.gogcli.image.digest }}{{- else }}:{{ .Values.gogcli.image.tag }}{{- end }}"
+          imagePullPolicy: {{ .Values.gogcli.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              mkdir -p /tools
+              src="$(command -v gogcli || command -v gog)"
+              cp "$src" /tools/gogcli
+              chmod 0755 /tools/gogcli
+          volumeMounts:
+            - name: local-bin
+              mountPath: /tools
+{{- end }}
+{{- if .Values.gogcli.enabled }}
+        - name: render-gogcli-config
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              base=/home/node/.config/gogcli
+              mkdir -p "$base/keyring"
+{{- range .Values.gogcli.secretFiles }}
+              if [ -f "/gogcli-secrets/{{ .secretKey }}" ]; then
+                mkdir -p "$(dirname "$base/{{ .path }}")"
+                cp "/gogcli-secrets/{{ .secretKey }}" "$base/{{ .path }}"
+              fi
+{{- end }}
+              chown -R 1000:1000 /home/node/.config
+              chmod -R go-rwx /home/node/.config/gogcli || true
+          volumeMounts:
+            - name: state
+              mountPath: /home/node/.openclaw
+            - name: gogcli-config
+              mountPath: /home/node/.config
+            - name: gogcli-secrets
+              mountPath: /gogcli-secrets
+              readOnly: true
+{{- end }}
+        - name: render-config
+          image: busybox:1.36
+          command: ["sh", "-c", "cp /config-source/openclaw.json /config-work/openclaw.json && chown 1000:1000 /config-work/openclaw.json && chmod 600 /config-work/openclaw.json"]
+          volumeMounts:
+            - name: config
+              mountPath: /config-source
+              readOnly: true
+            - name: config-work
+              mountPath: /config-work
+{{- if .Values.workspace.enabled }}
+        - name: sync-workspace
+          image: alpine/git:2.47.2
+          command: ["sh", "/workspace-sync/sync-workspace.sh"]
+          envFrom:
+            - secretRef:
+                name: workspace-git-credentials
+                optional: true
+          volumeMounts:
+            - name: workspace-sync
+              mountPath: /workspace-sync
+              readOnly: true
+            - name: state
+              mountPath: /home/node/.openclaw
+{{- end }}
+{{- if and .Values.runtimeTools.enabled (not .Values.image.bakedTools) }}
+        - name: install-runtime-tools
+          image: {{ .Values.runtimeTools.image | quote }}
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              export DEBIAN_FRONTEND=noninteractive
+              mkdir -p /tools/bin /tools/lib /tools/todoist /tools/tmp
+              apt-get update >/dev/null
+              apt-get install -y --no-install-recommends ca-certificates curl tar gzip npm {{- range .Values.runtimeTools.debianPackages }} {{ . }}{{- end }} >/dev/null
+              rm -rf /var/lib/apt/lists/*
+
+              copy_binary() {
+                src="$1"
+                dest="/tools/bin/$(basename "$src")"
+                cp -L "$src" "$dest"
+                chmod 0755 "$dest"
+                ldd "$src" 2>/dev/null | awk '/=> \//{print $3} /^\//{print $1}' | sort -u | while read -r lib; do
+                  [ -n "$lib" ] || continue
+                  cp -L "$lib" "/tools/lib/$(basename "$lib")"
+                done
+              }
+
+              copy_binary "$(command -v jq)"
+              copy_binary "$(command -v ssh)"
+              copy_binary "$(command -v scp)"
+              copy_binary "$(command -v sftp)"
+
+              arch="$(uname -m)"
+              case "$arch" in
+                x86_64|amd64) arch="amd64" ;;
+                aarch64|arm64) arch="arm64" ;;
+                *) echo "unsupported architecture: $arch" >&2; exit 1 ;;
+              esac
+{{- if .Values.runtimeTools.todoist.enabled }}
+              npm install --omit=dev --prefix /tools/todoist "{{ .Values.runtimeTools.todoist.package }}@{{ .Values.runtimeTools.todoist.version }}" >/dev/null
+              ln -sf /opt/openclaw-tools/todoist/node_modules/.bin/todoist /tools/bin/todoist
+{{- end }}
+{{- if .Values.runtimeTools.kubectl.enabled }}
+              curl -fsSL "https://dl.k8s.io/release/{{ .Values.runtimeTools.kubectl.version }}/bin/linux/${arch}/kubectl" -o /tools/bin/kubectl
+              chmod 0755 /tools/bin/kubectl
+{{- end }}
+{{- if .Values.runtimeTools.helm.enabled }}
+              helm_archive="helm-{{ .Values.runtimeTools.helm.version }}-linux-${arch}.tar.gz"
+              curl -fsSL "https://get.helm.sh/${helm_archive}" -o "/tools/tmp/${helm_archive}"
+              tar -xzf "/tools/tmp/${helm_archive}" -C /tools/tmp
+              install -m 0755 "/tools/tmp/linux-${arch}/helm" /tools/bin/helm
+{{- end }}
+{{- if .Values.runtimeTools.argocd.enabled }}
+              curl -fsSL "https://github.com/argoproj/argo-cd/releases/download/{{ .Values.runtimeTools.argocd.version }}/argocd-linux-${arch}" -o /tools/bin/argocd
+              chmod 0755 /tools/bin/argocd
+{{- end }}
+              chown -R 1000:1000 /tools
+          volumeMounts:
+            - name: runtime-tools
+              mountPath: /tools
+{{- end }}
+{{- if .Values.image.bakedTools }}
+        - name: seed-plugins
+          image: "{{ .Values.image.repository }}{{- if .Values.image.digest }}@{{ .Values.image.digest }}{{- else }}:{{ .Values.image.tag }}{{- end }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              baked=/opt/openclaw-baked-state/npm
+              live=/home/node/.openclaw/npm
+              if [ ! -d "$baked/node_modules/@openclaw" ]; then
+                echo "seed-plugins: no baked plugins at $baked/node_modules/@openclaw" >&2
+                exit 1
+              fi
+              mkdir -p "$live/node_modules/@openclaw"
+              expected="discord:{{ index .Values.seedPlugins.versions "discord" }} brave-plugin:{{ index .Values.seedPlugins.versions "brave-plugin" }}"
+              current="$(cat "$live/.baked-version" 2>/dev/null || true)"
+              if [ "$current" != "$expected" ]; then
+                rm -rf "$live/node_modules/@openclaw"/*
+                cp -R "$baked/node_modules/@openclaw"/. "$live/node_modules/@openclaw/"
+                node openclaw.mjs plugins registry --refresh >/dev/null
+                printf '%s' "$expected" > "$live/.baked-version"
+              fi
+              chown -R 1000:1000 /home/node/.openclaw/npm
+          env:
+            - name: HOME
+              value: /home/node
+            - name: OPENCLAW_HOME
+              value: /home/node
+            - name: OPENCLAW_STATE_DIR
+              value: /home/node/.openclaw
+            - name: OPENCLAW_WORKSPACE_DIR
+              value: /home/node/.openclaw/workspace
+            - name: OPENCLAW_CONFIG_PATH
+              value: /config-work/openclaw.json
+          volumeMounts:
+            - name: config-work
+              mountPath: /config-work
+            - name: state
+              mountPath: /home/node/.openclaw
+{{- else }}
+        - name: install-channel-plugins
+          image: "{{ .Values.image.repository }}{{- if .Values.image.digest }}@{{ .Values.image.digest }}{{- else }}:{{ .Values.image.tag }}{{- end }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              ensure_plugin() {
+                package="$1"
+                version="$2"
+                package_json="/home/node/.openclaw/npm/node_modules/${package}/package.json"
+                installed_version="$(node -e 'try{process.stdout.write(require(process.argv[1]).version)}catch{}' "$package_json")"
+                if [ "$installed_version" != "$version" ]; then
+                  node openclaw.mjs plugins install "${package}@${version}" --force --pin
+                fi
+              }
+              ensure_plugin @openclaw/discord 2026.5.7
+              ensure_plugin @openclaw/brave-plugin 2026.5.7
+              node openclaw.mjs plugins registry --refresh >/dev/null
+              chown -R 1000:1000 /home/node/.openclaw
+          env:
+            - name: PATH
+              value: /opt/openclaw-tools/bin:/home/node/.local/bin:/usr/local/bin:/usr/bin:/bin
+            - name: LD_LIBRARY_PATH
+              value: /opt/openclaw-tools/lib
+            - name: GOG_KEYRING_BACKEND
+              value: file
+            - name: HOME
+              value: /home/node
+            - name: OPENCLAW_HOME
+              value: /home/node
+            - name: OPENCLAW_STATE_DIR
+              value: /home/node/.openclaw
+            - name: OPENCLAW_WORKSPACE_DIR
+              value: /home/node/.openclaw/workspace
+            - name: OPENCLAW_CONFIG_PATH
+              value: /config-work/openclaw.json
+          volumeMounts:
+            - name: config-work
+              mountPath: /config-work
+            - name: state
+              mountPath: /home/node/.openclaw
+{{- if .Values.runtimeTools.enabled }}
+            - name: runtime-tools
+              mountPath: /opt/openclaw-tools
+{{- end }}
+{{- if .Values.gogcli.enabled }}
+            - name: local-bin
+              mountPath: /home/node/.local/bin
+            - name: gogcli-config
+              mountPath: /home/node/.config
+{{- end }}
+{{- end }}
+      containers:
+        - name: openclaw
+          image: "{{ .Values.image.repository }}{{- if .Values.image.digest }}@{{ .Values.image.digest }}{{- else }}:{{ .Values.image.tag }}{{- end }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["node", "openclaw.mjs", "gateway", "--allow-unconfigured", "--port", "{{ .Values.service.port }}"]
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              hostPort: {{ .Values.service.port }}
+          env:
+            - name: PATH
+              value: /opt/openclaw-tools/bin:/home/node/.local/bin:/usr/local/bin:/usr/bin:/bin
+            - name: LD_LIBRARY_PATH
+              value: /opt/openclaw-tools/lib
+            - name: GOG_KEYRING_BACKEND
+              value: file
+            - name: HOME
+              value: /home/node
+            - name: OPENCLAW_HOME
+              value: /home/node
+            - name: OPENCLAW_STATE_DIR
+              value: /home/node/.openclaw
+            - name: OPENCLAW_WORKSPACE_DIR
+              value: /home/node/.openclaw/workspace
+            - name: OPENCLAW_CONFIG_PATH
+              value: /config-work/openclaw.json
+          envFrom:
+            - secretRef:
+                name: openclaw-secrets
+                optional: true
+          volumeMounts:
+            - name: config-work
+              mountPath: /config-work
+            - name: state
+              mountPath: /home/node/.openclaw
+{{- if and .Values.runtimeTools.enabled (not .Values.image.bakedTools) }}
+            - name: runtime-tools
+              mountPath: /opt/openclaw-tools
+{{- end }}
+{{- if .Values.gogcli.enabled }}
+{{- if not .Values.image.bakedTools }}
+            - name: local-bin
+              mountPath: /home/node/.local/bin
+{{- end }}
+            - name: gogcli-config
+              mountPath: /home/node/.config
+{{- end }}
+{{- if .Values.probes.startup.enabled }}
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+{{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+{{- with .Values.resources }}
+          resources:
+{{ toYaml . | indent 12 }}
+{{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "openclaw.fullname" . }}-config
+        - name: config-work
+          emptyDir: {}
+{{- if and .Values.runtimeTools.enabled (not .Values.image.bakedTools) }}
+        - name: runtime-tools
+          emptyDir: {}
+{{- end }}
+{{- if .Values.gogcli.enabled }}
+{{- if not .Values.image.bakedTools }}
+        - name: local-bin
+          emptyDir: {}
+{{- end }}
+        - name: gogcli-config
+          emptyDir: {}
+        - name: gogcli-secrets
+          secret:
+            secretName: {{ .Values.gogcli.secretName }}
+            optional: true
+{{- end }}
+{{- if .Values.workspace.enabled }}
+        - name: workspace-sync
+          configMap:
+            name: {{ include "openclaw.fullname" . }}-workspace-sync
+            defaultMode: 0755
+{{- end }}
+        - name: state
+          persistentVolumeClaim:
+            claimName: {{ include "openclaw.fullname" . }}-state

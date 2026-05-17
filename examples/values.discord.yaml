@@ -1,0 +1,32 @@
+# Example Discord channel configuration. Replace every placeholder.
+config:
+  channels:
+    discord:
+      enabled: true
+      token:
+        source: env
+        provider: default
+        id: DISCORD_BOT_TOKEN
+      allowFrom:
+        - "YOUR_DISCORD_USER_ID"
+      dmPolicy: allowlist
+      groupPolicy: allowlist
+      guilds:
+        "YOUR_GUILD_ID":
+          requireMention: true
+          users:
+            - "YOUR_DISCORD_USER_ID"
+      streaming:
+        mode: "off"
+  plugins:
+    allow:
+      - openai
+      - discord
+      - memory-core
+      - browser
+    entries:
+      discord:
+        enabled: true
+        config: {}
+      openai:
+        enabled: true

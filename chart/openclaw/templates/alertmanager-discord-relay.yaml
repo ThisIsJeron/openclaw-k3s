@@ -1,0 +1,54 @@
+{{- if .Values.monitoring.alertmanager.discord.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager-discord-relay
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: alertmanager-discord-relay
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alertmanager-discord-relay
+  template:
+    metadata:
+      labels:
+        app: alertmanager-discord-relay
+    spec:
+      containers:
+        - name: relay
+          image: "{{ .Values.monitoring.alertmanager.discord.image.repository }}:{{ .Values.monitoring.alertmanager.discord.image.tag }}"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 9094
+          env:
+            - name: DISCORD_WEBHOOK
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.monitoring.alertmanager.discord.webhookSecretName | quote }}
+                  key: {{ .Values.monitoring.alertmanager.discord.webhookSecretKey | quote }}
+            - name: LISTEN_ADDRESS
+              value: ":9094"
+{{- with .Values.monitoring.alertmanager.discord.resources }}
+          resources:
+{{ toYaml . | indent 12 }}
+{{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager-discord-relay
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: alertmanager-discord-relay
+spec:
+  type: ClusterIP
+  selector:
+    app: alertmanager-discord-relay
+  ports:
+    - name: http
+      port: 9094
+      targetPort: 9094
+{{- end }}

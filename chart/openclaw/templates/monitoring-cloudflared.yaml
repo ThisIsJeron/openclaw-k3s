@@ -1,0 +1,30 @@
+{{- if and (index .Values "kube-prometheus-stack" "enabled") .Values.monitoring.publicAccess.cloudflared.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana-cloudflared
+  namespace: {{ .Release.Namespace }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana-cloudflared
+  template:
+    metadata:
+      labels:
+        app: grafana-cloudflared
+    spec:
+      containers:
+        - name: cloudflared
+          image: {{ .Values.monitoring.publicAccess.cloudflared.image | quote }}
+          imagePullPolicy: IfNotPresent
+          args:
+            - tunnel
+            - --no-autoupdate
+            - --url
+            - {{ .Values.monitoring.publicAccess.cloudflared.target | quote }}
+{{- with .Values.monitoring.publicAccess.cloudflared.resources }}
+          resources:
+{{ toYaml . | indent 12 }}
+{{- end }}
+{{- end }}

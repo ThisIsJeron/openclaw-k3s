@@ -1,0 +1,31 @@
+# Example Slack channel configuration. Replace every placeholder.
+config:
+  channels:
+    slack:
+      enabled: true
+      mode: socket
+      appToken:
+        source: env
+        provider: default
+        id: SLACK_APP_TOKEN
+      botToken:
+        source: env
+        provider: default
+        id: SLACK_BOT_TOKEN
+      userTokenReadOnly: true
+      dmPolicy: allowlist
+      allowFrom:
+        - YOUR_SLACK_USER_ID
+      requireMention: true
+  plugins:
+    allow:
+      - openai
+      - slack
+      - memory-core
+      - browser
+    entries:
+      slack:
+        enabled: true
+        config: {}
+      openai:
+        enabled: true

@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "openclaw.fullname" . }}-config
+data:
+  openclaw.json: |
+{{ .Values.config | toPrettyJson | indent 4 }}

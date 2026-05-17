@@ -1,0 +1,57 @@
+# Root Application — the "app-of-apps" pattern. ArgoCD applies the
+# manifests in argocd/apps/, which in turn declare individual
+# Applications (openclaw, eventually argocd itself, monitoring stack
+# additions, etc.).
+#
+# Bootstrap: kubectl apply -f argocd/root/root.yaml
+# (one time. After that, edits to argocd/apps/*.yaml flow through Git.)
+#
+# Once the root app reconciles, manage everything via PRs that touch
+# argocd/apps/. The root app's selfHeal will re-apply removed children
+# if they get manually deleted, which is what you want for an immutable
+# infrastructure declaration.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: openclaw-root
+  namespace: argocd
+  # finalizers ensure ArgoCD cleans up children if root is ever deleted
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/YOUR_GITHUB_ORG/openclaw-k3s.git
+    # Root tracks main HEAD — this is acceptable because the child
+    # Applications themselves still pin individual SHAs. Changing the
+    # root would only happen via a PR that adds/removes an app.
+    targetRevision: main
+    path: argocd/apps
+    directory:
+      recurse: true
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  # Don't fight gitops-guard. The guard rolls back an unhealthy revision
+  # by patching the child Application's spec.source.targetRevision to
+  # the LKG SHA. Without this ignoreDifferences entry, root's selfHeal
+  # immediately reverts that patch — guard and root oscillate, the pod
+  # thrashes between revisions, and the rollback never lands.
+  #
+  # With this entry, root's diff IGNORES targetRevision drift on child
+  # Applications. The guard's patch sticks. Promotions still work
+  # because git pushes to apps/*.yaml trigger a full sync that applies
+  # the full manifest (ignoreDifferences only affects diff, not sync,
+  # by default — RespectIgnoreDifferences is NOT set).
+  ignoreDifferences:
+    - group: argoproj.io
+      kind: Application
+      jqPathExpressions:
+        - ".spec.source.targetRevision"
+  syncPolicy:
+    automated:
+      selfHeal: true
+      # No prune on the root either — if a child Application file is
+      # accidentally removed, ArgoCD won't tear down the running app.
+    syncOptions:
+      - CreateNamespace=true

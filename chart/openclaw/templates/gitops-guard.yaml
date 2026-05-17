@@ -1,0 +1,353 @@
+{{- if .Values.gitopsGuard.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "openclaw.fullname" . }}-gitops-guard
+  namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "openclaw.fullname" . }}-gitops-guard
+  namespace: {{ .Release.Namespace }}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods", "services"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["services/proxy"]
+    verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "openclaw.fullname" . }}-gitops-guard
+  namespace: {{ .Release.Namespace }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "openclaw.fullname" . }}-gitops-guard
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "openclaw.fullname" . }}-gitops-guard
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "openclaw.fullname" . }}-gitops-guard
+  namespace: {{ .Values.gitopsGuard.appNamespace }}
+rules:
+  - apiGroups: ["argoproj.io"]
+    resources: ["applications"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "openclaw.fullname" . }}-gitops-guard
+  namespace: {{ .Values.gitopsGuard.appNamespace }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "openclaw.fullname" . }}-gitops-guard
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "openclaw.fullname" . }}-gitops-guard
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "openclaw.fullname" . }}-gitops-guard-script
+  namespace: {{ .Release.Namespace }}
+data:
+  guard.sh: |-
+    #!/bin/sh
+    set -eu
+
+    APP_NAMESPACE="${APP_NAMESPACE:-argocd}"
+    APP_NAME="${APP_NAME:-openclaw}"
+    TARGET_NAMESPACE="${TARGET_NAMESPACE:-openclaw}"
+    DEPLOYMENT_NAME="${DEPLOYMENT_NAME:-openclaw}"
+    SERVICE_NAME="${SERVICE_NAME:-openclaw}"
+    SERVICE_PORT="${SERVICE_PORT:-18789}"
+    LKG_CONFIGMAP="${LKG_CONFIGMAP:-openclaw-last-known-good}"
+    PROMOTE_AFTER_SECONDS="${PROMOTE_AFTER_SECONDS:-600}"
+    ROLLBACK_AFTER_SECONDS="${ROLLBACK_AFTER_SECONDS:-180}"
+    DISCORD_CHANNEL_ID="${DISCORD_CHANNEL_ID:-}"
+
+    now_epoch="$(date +%s)"
+    now_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    log() { printf '[gitops-guard] %s\n' "$*"; }
+
+    json_escape() {
+      if command -v jq >/dev/null 2>&1; then
+        jq -Rn --arg s "$1" '$s'
+      else
+        printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+      fi
+    }
+
+    alert() {
+      msg="$1"
+      log "ALERT: $msg"
+      if [ -n "${DISCORD_BOT_TOKEN:-}" ] && [ -n "$DISCORD_CHANNEL_ID" ] && command -v curl >/dev/null 2>&1; then
+        content="$(json_escape "$msg")"
+        curl -fsS \
+          -H "Authorization: Bot ${DISCORD_BOT_TOKEN}" \
+          -H "Content-Type: application/json" \
+          -d "{\"content\":${content}}" \
+          "https://discord.com/api/v10/channels/${DISCORD_CHANNEL_ID}/messages" >/dev/null || true
+      fi
+    }
+
+    cm_exists() {
+      kubectl -n "$TARGET_NAMESPACE" get configmap "$LKG_CONFIGMAP" >/dev/null 2>&1
+    }
+
+    cm_get() {
+      key="$1"
+      kubectl -n "$TARGET_NAMESPACE" get configmap "$LKG_CONFIGMAP" -o "jsonpath={.data.${key}}" 2>/dev/null || true
+    }
+
+    cm_patch_data() {
+      # args are JSON members for .data, e.g. "revision":"abc"
+      kubectl -n "$TARGET_NAMESPACE" patch configmap "$LKG_CONFIGMAP" --type=merge -p "{\"data\":{$*}}" >/dev/null
+    }
+
+    ensure_cm() {
+      if ! cm_exists; then
+        kubectl -n "$TARGET_NAMESPACE" create configmap "$LKG_CONFIGMAP" \
+          --from-literal=revision= \
+          --from-literal=previousRevision= \
+          --from-literal=promotedAt= \
+          --from-literal=candidateRevision= \
+          --from-literal=candidateFirstSeenEpoch=0 \
+          --from-literal=lastCheckedAt="$now_iso" \
+          --from-literal=lastDecision=created >/dev/null
+      fi
+    }
+
+    app_jsonpath() {
+      kubectl -n "$APP_NAMESPACE" get application "$APP_NAME" -o "jsonpath=$1" 2>/dev/null || true
+    }
+
+    revision="$(app_jsonpath '{.status.sync.revision}')"
+    operation_revision="$(app_jsonpath '{.status.operationState.syncResult.revision}')"
+    sync_status="$(app_jsonpath '{.status.sync.status}')"
+    health_status="$(app_jsonpath '{.status.health.status}')"
+    target_revision="$(app_jsonpath '{.spec.source.targetRevision}')"
+    observed_revision="${revision:-${operation_revision:-$target_revision}}"
+    revision_short="$(printf '%s' "$observed_revision" | cut -c1-7)"
+
+    available="$(kubectl -n "$TARGET_NAMESPACE" get deployment "$DEPLOYMENT_NAME" -o 'jsonpath={.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || true)"
+    pods="$(kubectl -n "$TARGET_NAMESPACE" get pods -l "app.kubernetes.io/name=${DEPLOYMENT_NAME}" --no-headers 2>/dev/null || true)"
+    pod_describe="$(kubectl -n "$TARGET_NAMESPACE" get pods -l "app.kubernetes.io/name=${DEPLOYMENT_NAME}" -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .status.initContainerStatuses[*]}init:{.name}:{.state.waiting.reason}{.state.terminated.reason}:{.lastState.terminated.exitCode}{" "}{end}{range .status.containerStatuses[*]}ctr:{.name}:{.state.waiting.reason}{.state.terminated.reason}:{.lastState.terminated.exitCode}{" "}{end}{"\n"}{end}' 2>/dev/null || true)"
+    bad_pods="$(printf '%s\n%s\n' "$pods" "$pod_describe" | grep -E 'Init:Error|Init:CrashLoopBackOff|Init:ImagePullBackOff|Init:ErrImagePull|CrashLoopBackOff|ImagePullBackOff|CreateContainerConfigError|ErrImagePull|RunContainerError|Error:[1-9][0-9]*' || true)"
+
+    check_endpoint() {
+      endpoint="$1"
+      tmp="/tmp/gitops-guard-${endpoint}-$$"
+      status="fail"
+      if kubectl get --raw "/api/v1/namespaces/${TARGET_NAMESPACE}/services/http:${SERVICE_NAME}:${SERVICE_PORT}/proxy/${endpoint}" >"$tmp" 2>"$tmp.err"; then
+        case "$endpoint" in
+          readyz)
+            if grep -q '^ok' "$tmp" || grep -q '"ready"[[:space:]]*:[[:space:]]*true' "$tmp"; then
+              status="ok"
+            fi
+            ;;
+          healthz)
+            # /healthz returns HTTP 200 with payloads like {"ok":true,"status":"live"}.
+            # A successful service-proxy response is enough for this guard check.
+            status="ok"
+            ;;
+          *)
+            status="ok"
+            ;;
+        esac
+      fi
+      rm -f "$tmp" "$tmp.err"
+      [ "$status" = "ok" ]
+    }
+
+    readyz="fail"
+    readyz_attempt=1
+    readyz_attempts="${READYZ_DEBOUNCE_ATTEMPTS:-3}"
+    readyz_sleep="${READYZ_DEBOUNCE_SLEEP_SECONDS:-60}"
+    while [ "$readyz_attempt" -le "$readyz_attempts" ]; do
+      if check_endpoint readyz; then
+        readyz="ok"
+        break
+      fi
+      log "readyz attempt ${readyz_attempt}/${readyz_attempts} failed"
+      if [ "$readyz_attempt" -lt "$readyz_attempts" ]; then
+        sleep "$readyz_sleep"
+      fi
+      readyz_attempt=$((readyz_attempt + 1))
+    done
+
+    healthz="fail"
+    if check_endpoint healthz; then
+      healthz="ok"
+    fi
+
+    ensure_cm
+    lkg="$(cm_get revision)"
+    previous="$(cm_get previousRevision)"
+    candidate="$(cm_get candidateRevision)"
+    candidate_first="$(cm_get candidateFirstSeenEpoch)"
+    candidate_first="${candidate_first:-0}"
+
+    healthy="false"
+    failure_reason=""
+    [ -n "$observed_revision" ] || failure_reason="${failure_reason} no-observed-revision"
+    [ "$sync_status" = "Synced" ] || failure_reason="${failure_reason} sync=${sync_status:-unknown}"
+    [ "$health_status" = "Healthy" ] || failure_reason="${failure_reason} app-health=${health_status:-unknown}"
+    [ "$available" = "True" ] || failure_reason="${failure_reason} deployment-available=${available:-unknown}"
+    [ "$healthz" = "ok" ] || failure_reason="${failure_reason} healthz=$healthz"
+    [ "$readyz" = "ok" ] || failure_reason="${failure_reason} readyz=$readyz healthz=$healthz"
+    [ -z "$bad_pods" ] || failure_reason="${failure_reason} bad-pods=$(printf '%s' "$bad_pods" | tr '\n' ';' | cut -c1-220)"
+    if [ -n "$revision" ] && [ -z "$failure_reason" ]; then
+      healthy="true"
+    fi
+
+    log "observed=${revision_short:-unknown} syncedRevision=$(printf '%s' "$revision" | cut -c1-7) opRevision=$(printf '%s' "$operation_revision" | cut -c1-7) target=${target_revision:-unknown} sync=${sync_status:-unknown} health=${health_status:-unknown} available=${available:-unknown} readyz=$readyz healthz=$healthz healthy=$healthy reason=${failure_reason:-none} lkg=$(printf '%s' "$lkg" | cut -c1-7) candidate=$(printf '%s' "$candidate" | cut -c1-7)"
+
+    # Pinned revisions are never promoted. If a non-LKG pinned revision is unhealthy,
+    # still roll it back after the grace period.
+    pinned="false"
+    if [ -n "$target_revision" ] && [ "$target_revision" != "main" ]; then
+      pinned="true"
+    fi
+
+    if [ -z "$lkg" ]; then
+      if [ "$healthy" = "true" ]; then
+        cm_patch_data "\"revision\":\"$revision\",\"previousRevision\":\"\",\"promotedAt\":\"$now_iso\",\"candidateRevision\":\"\",\"candidateFirstSeenEpoch\":\"0\",\"lastCheckedAt\":\"$now_iso\",\"lastDecision\":\"initialized-lkg\""
+        alert "✅ OpenClaw GitOps guard initialized last-known-good revision ${revision_short}."
+      else
+        cm_patch_data "\"lastCheckedAt\":\"$now_iso\",\"lastDecision\":\"no-lkg-and-unhealthy\",\"lastFailureReason\":$(json_escape "${failure_reason:-unknown}")"
+        alert "🚨 OpenClaw GitOps guard found no LKG and current revision ${revision_short:-unknown} is unhealthy; manual intervention required: ${failure_reason:-unknown}."
+      fi
+      exit 0
+    fi
+
+    if [ "$observed_revision" = "$lkg" ]; then
+      if [ "$healthy" = "true" ]; then
+        cm_patch_data "\"candidateRevision\":\"\",\"candidateFirstSeenEpoch\":\"0\",\"lastCheckedAt\":\"$now_iso\",\"lastDecision\":\"at-lkg\",\"lastFailureReason\":\"\""
+      else
+        cm_patch_data "\"lastCheckedAt\":\"$now_iso\",\"lastDecision\":\"lkg-unhealthy\",\"lastFailureReason\":$(json_escape "${failure_reason:-unknown}")"
+        alert "🚨 OpenClaw LKG ${revision_short:-unknown} is unhealthy; manual intervention required: ${failure_reason:-unknown}."
+      fi
+      exit 0
+    fi
+
+    candidate_key="${observed_revision:-unknown}"
+    if [ "$candidate" != "$candidate_key" ]; then
+      cm_patch_data "\"candidateRevision\":\"$candidate_key\",\"candidateFirstSeenEpoch\":\"$now_epoch\",\"lastCheckedAt\":\"$now_iso\",\"lastDecision\":\"new-candidate\",\"lastFailureReason\":$(json_escape "${failure_reason:-none}")"
+      exit 0
+    fi
+
+    age=$(( now_epoch - candidate_first ))
+
+    if [ "$healthy" = "true" ]; then
+      if [ "$pinned" = "true" ]; then
+        cm_patch_data "\"lastCheckedAt\":\"$now_iso\",\"lastDecision\":\"pinned-healthy-no-promotion\",\"lastFailureReason\":\"\""
+      elif [ "$age" -ge "$PROMOTE_AFTER_SECONDS" ]; then
+        lkg_short="$(printf '%s' "$lkg" | cut -c1-7)"
+        cm_patch_data "\"revision\":\"$revision\",\"previousRevision\":\"$lkg\",\"promotedAt\":\"$now_iso\",\"candidateRevision\":\"\",\"candidateFirstSeenEpoch\":\"0\",\"lastCheckedAt\":\"$now_iso\",\"lastDecision\":\"promoted\",\"lastFailureReason\":\"\""
+        alert "✅ OpenClaw GitOps guard promoted ${revision_short} to last-known-good (previous ${lkg_short})."
+      else
+        cm_patch_data "\"lastCheckedAt\":\"$now_iso\",\"lastDecision\":\"candidate-healthy-waiting\",\"lastFailureReason\":\"\""
+      fi
+      exit 0
+    fi
+
+    if [ "$age" -lt "$ROLLBACK_AFTER_SECONDS" ]; then
+      cm_patch_data "\"lastCheckedAt\":\"$now_iso\",\"lastDecision\":\"candidate-unhealthy-grace\",\"lastFailureReason\":$(json_escape "${failure_reason:-unknown}")"
+      exit 0
+    fi
+
+    lkg_short="$(printf '%s' "$lkg" | cut -c1-7)"
+    cm_patch_data "\"lastCheckedAt\":\"$now_iso\",\"lastDecision\":\"rollback-to-lkg\",\"rollbackFrom\":\"$candidate_key\",\"rollbackAt\":\"$now_iso\",\"lastFailureReason\":$(json_escape "${failure_reason:-unknown}")"
+    alert "🚨 OpenClaw GitOps guard rolling back ${revision_short:-unknown} to LKG ${lkg_short}: ${failure_reason:-unknown}."
+
+    kubectl -n "$APP_NAMESPACE" patch application "$APP_NAME" --type=merge -p "{\"spec\":{\"source\":{\"targetRevision\":\"$lkg\"}}}" >/dev/null
+    kubectl -n "$APP_NAMESPACE" annotate application "$APP_NAME" argocd.argoproj.io/refresh=hard --overwrite >/dev/null
+    # Best-effort immediate sync request. Automated sync should also reconcile this,
+    # but an explicit operation prevents rollback from depending solely on refresh timing.
+    kubectl -n "$APP_NAMESPACE" patch application "$APP_NAME" --type=merge -p "{\"operation\":{\"sync\":{\"revision\":\"$lkg\",\"prune\":true}}}" >/dev/null 2>&1 || true
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "openclaw.fullname" . }}-gitops-guard
+  namespace: {{ .Release.Namespace }}
+spec:
+  schedule: {{ .Values.gitopsGuard.schedule | quote }}
+  suspend: {{ .Values.gitopsGuard.suspend | default false }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ include "openclaw.fullname" . }}-gitops-guard
+          containers:
+            - name: guard
+              image: {{ .Values.gitopsGuard.image | quote }}
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "/guard/guard.sh"]
+              env:
+                - name: APP_NAMESPACE
+                  value: {{ .Values.gitopsGuard.appNamespace | quote }}
+                - name: APP_NAME
+                  value: {{ .Values.gitopsGuard.appName | quote }}
+                - name: TARGET_NAMESPACE
+                  value: {{ .Values.gitopsGuard.targetNamespace | quote }}
+                - name: DEPLOYMENT_NAME
+                  value: {{ .Values.gitopsGuard.deploymentName | quote }}
+                - name: SERVICE_NAME
+                  value: {{ .Values.gitopsGuard.serviceName | quote }}
+                - name: SERVICE_PORT
+                  value: {{ .Values.gitopsGuard.servicePort | quote }}
+                - name: LKG_CONFIGMAP
+                  value: {{ .Values.gitopsGuard.lkgConfigMapName | quote }}
+                - name: PROMOTE_AFTER_SECONDS
+                  value: {{ .Values.gitopsGuard.promoteAfterSeconds | quote }}
+                - name: ROLLBACK_AFTER_SECONDS
+                  value: {{ .Values.gitopsGuard.rollbackAfterSeconds | quote }}
+{{- if .Values.gitopsGuard.alerts.discord.enabled }}
+                - name: DISCORD_CHANNEL_ID
+                  value: {{ .Values.gitopsGuard.alerts.discord.channelId | quote }}
+                - name: DISCORD_BOT_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.gitopsGuard.alerts.discord.tokenSecretName | quote }}
+                      key: {{ .Values.gitopsGuard.alerts.discord.tokenSecretKey | quote }}
+                      optional: true
+{{- end }}
+              volumeMounts:
+                - name: guard-script
+                  mountPath: /guard
+                  readOnly: true
+{{- with .Values.gitopsGuard.resources }}
+              resources:
+{{ toYaml . | indent 16 }}
+{{- end }}
+          volumes:
+            - name: guard-script
+              configMap:
+                name: {{ include "openclaw.fullname" . }}-gitops-guard-script
+                defaultMode: 0755
+{{- end }}

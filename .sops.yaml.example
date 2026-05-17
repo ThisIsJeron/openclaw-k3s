@@ -1,0 +1,5 @@
+# Example only. Replace the recipient with your own age public key.
+creation_rules:
+  - path_regex: chart/openclaw/secrets/.*\.enc\.yaml$
+    encrypted_regex: '^(data|stringData)$'
+    age: age1REPLACE_WITH_YOUR_PUBLIC_RECIPIENT

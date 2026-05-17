@@ -1,0 +1,4 @@
+*.secret.*
+.env
+.DS_Store
+chart/*/charts/

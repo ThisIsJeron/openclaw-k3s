@@ -1,0 +1,45 @@
+# Minimal public-safe values overlay.
+image:
+  repository: ghcr.io/YOUR_GITHUB_ORG/openclaw
+  tag: latest
+  digest: ""
+  pullSecrets: []
+
+config:
+  gateway:
+    port: 18789
+    bind: lan
+    reload:
+      mode: hybrid
+  channels: {}
+  plugins:
+    allow:
+      - openai
+      - memory-core
+      - browser
+      - brave
+    entries:
+      openai:
+        enabled: true
+      brave:
+        enabled: true
+
+gogcli:
+  enabled: false
+
+monitoring:
+  alertmanager:
+    discord:
+      enabled: false
+  publicAccess:
+    cloudflared:
+      enabled: false
+    ngrok:
+      enabled: false
+
+backup:
+  enabled: false
+
+workspace:
+  enabled: true
+  projects: []

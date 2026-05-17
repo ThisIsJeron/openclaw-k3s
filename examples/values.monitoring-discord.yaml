@@ -1,0 +1,22 @@
+# Optional Alertmanager -> Discord relay. Requires a Secret named
+# openclaw-alertmanager-discord with key webhook-url in the openclaw namespace.
+monitoring:
+  alertmanager:
+    discord:
+      enabled: true
+
+kube-prometheus-stack:
+  alertmanager:
+    config:
+      route:
+        group_by: ["alertname", "severity"]
+        group_wait: 30s
+        group_interval: 5m
+        repeat_interval: 12h
+        receiver: discord
+      receivers:
+        - name: "null"
+        - name: discord
+          webhook_configs:
+            - url: http://alertmanager-discord-relay.openclaw.svc.cluster.local:9094/alert
+              send_resolved: true

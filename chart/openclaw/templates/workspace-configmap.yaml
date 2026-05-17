@@ -1,0 +1,62 @@
+{{- if .Values.workspace.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "openclaw.fullname" . }}-workspace-sync
+data:
+  sync-workspace.sh: |-
+    #!/bin/sh
+    set -eu
+
+    workspace="/home/node/.openclaw/workspace"
+    mkdir -p "$workspace"
+
+    echo "[workspace-sync] applying GitOps workspace overlay"
+{{- range $path, $_ := .Files.Glob "workspace/**" }}
+{{- if not (hasSuffix "/" $path) }}
+    mkdir -p "$workspace/{{ dir (trimPrefix "workspace/" $path) }}"
+    cat > "$workspace/{{ trimPrefix "workspace/" $path }}" <<'__OPENCLAW_WORKSPACE_FILE__'
+{{ $.Files.Get $path | indent 4 }}
+    __OPENCLAW_WORKSPACE_FILE__
+{{- end }}
+{{- end }}
+
+{{- if .Values.workspace.projects }}
+    echo "[workspace-sync] reconciling declared project checkouts"
+    if [ -n "${GIT_USERNAME:-}" ] && [ -n "${GIT_PASSWORD:-}" ]; then
+      git config --global credential.helper store
+    fi
+{{- range .Values.workspace.projects }}
+{{- if .enabled }}
+    repo={{ .repo | quote }}
+    dest="$workspace/{{ .path }}"
+    branch={{ default "main" .branch | quote }}
+    if [ -n "${GIT_USERNAME:-}" ] && [ -n "${GIT_PASSWORD:-}" ]; then
+      protocol="$(printf '%s' "$repo" | sed -E 's#^(https?)://.*#\1#')"
+      host="$(printf '%s' "$repo" | sed -E 's#^https?://([^/]+)/.*#\1#')"
+      printf 'protocol=%s\nhost=%s\nusername=%s\npassword=%s\n\n' "$protocol" "$host" "$GIT_USERNAME" "$GIT_PASSWORD" | git credential approve || true
+    fi
+    mkdir -p "$(dirname "$dest")"
+    if [ -d "$dest/.git" ]; then
+      echo "[workspace-sync] updating {{ .name }}"
+      git config --global --add safe.directory "$dest" || true
+      git -C "$dest" remote set-url origin "$repo" || true
+      git -C "$dest" fetch --depth=1 origin "$branch"
+      git -C "$dest" reset --hard HEAD || true
+      git -C "$dest" clean -fdx || true
+      git -C "$dest" checkout -B "$branch" "origin/$branch"
+      git -C "$dest" reset --hard "origin/$branch"
+      git -C "$dest" clean -fdx || true
+    else
+      echo "[workspace-sync] cloning {{ .name }}"
+      rm -rf "$dest"
+      git clone --depth=1 --branch "$branch" "$repo" "$dest"
+      git config --global --add safe.directory "$dest" || true
+    fi
+{{- end }}
+{{- end }}
+{{- end }}
+
+    chown -R 1000:1000 "$workspace"
+    echo "[workspace-sync] complete"
+{{- end }}

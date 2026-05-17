@@ -1,0 +1,46 @@
+{{- if and (index .Values "kube-prometheus-stack" "enabled") .Values.monitoring.publicAccess.ngrok.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "openclaw.fullname" . }}-grafana-ngrok
+  labels:
+    app.kubernetes.io/name: {{ include "openclaw.fullname" . }}-grafana-ngrok
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "openclaw.fullname" . }}-grafana-ngrok
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "openclaw.fullname" . }}-grafana-ngrok
+    spec:
+      containers:
+        - name: ngrok
+          image: {{ .Values.monitoring.publicAccess.ngrok.image | quote }}
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-ec"]
+          args:
+            - |
+              set -eu
+              args="http ${NGROK_TARGET} --log=stdout"
+              if [ -n "${NGROK_DOMAIN:-}" ]; then
+                args="$args --domain=${NGROK_DOMAIN}"
+              fi
+              if [ -n "${NGROK_REGION:-}" ]; then
+                args="$args --region=${NGROK_REGION}"
+              fi
+              exec ngrok $args
+          env:
+            - name: NGROK_TARGET
+              value: {{ .Values.monitoring.publicAccess.ngrok.target | quote }}
+            - name: NGROK_DOMAIN
+              value: {{ default "" .Values.monitoring.publicAccess.ngrok.domain | quote }}
+            - name: NGROK_REGION
+              value: {{ default "" .Values.monitoring.publicAccess.ngrok.region | quote }}
+            - name: NGROK_AUTHTOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.monitoring.publicAccess.ngrok.existingSecret | quote }}
+                  key: {{ .Values.monitoring.publicAccess.ngrok.authtokenKey | quote }}
+{{- end }}
