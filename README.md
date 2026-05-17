@@ -6,17 +6,20 @@ This repository is a sanitized public template extracted from a real private dep
 
 ## Why use this instead of the default setup?
 
-The default OpenClaw setup is great for getting started quickly: install it, run it, connect a channel, and iterate. This template is for the next stage — when OpenClaw has become useful enough that you want it to survive restarts, upgrades, host maintenance, and your own future forgetfulness.
+The official [OpenClaw Kubernetes install guide](https://docs.openclaw.ai/install/kubernetes#kubernetes) is intentionally a minimal starting point: a Kustomize-based deployment, one namespace, one Gateway pod, a Service, a PVC, a ConfigMap, and a Secret. It is great for proving that OpenClaw runs in Kubernetes and for adapting the upstream manifests to your own cluster.
+
+This repo starts from that same model and carries it further for long-running k3s/homelab use. It keeps the important upstream assumptions — single active Gateway, persistent OpenClaw state, Kubernetes Secrets, health checks, and safe-by-default local access — but adds the operational scaffolding you usually discover you need after OpenClaw becomes part of daily life.
 
 Adopting this setup gives you:
 
-- **Reproducibility:** the Gateway deployment, baseline config, runtime tools, and workspace overlay are declared in Git instead of living as one-off host state.
-- **Safer operations:** Argo CD, Helm rendering checks, health probes, rollback scripts, and the GitOps guard make changes more auditable and less “SSH into the box and hope.”
-- **Persistent state:** OpenClaw’s mutable home directory lives on a PVC, so sessions, credentials, workspace files, and runtime state are not tied to a single container lifecycle.
-- **Monitoring and recovery hooks:** Prometheus/Grafana, Alertmanager integration, backup CronJobs, and restore-drill docs are built in rather than bolted on later.
-- **A cleaner path to production-ish homelab use:** secrets, channel config, image builds, and disaster recovery are treated as first-class concerns from the start.
+- **Reproducibility:** the Gateway deployment, baseline config, runtime tools, workspace overlay, and managed project clones are declared in Git instead of living as one-off host state.
+- **GitOps instead of manual redeploys:** Argo CD tracks the desired state, while Helm values make environment-specific changes cleaner than editing raw manifests.
+- **Safer operations:** Helm rendering checks, health probes, rollback scripts, and the GitOps guard make changes more auditable and less “SSH into the box and hope.”
+- **Persistent state with clearer ownership:** OpenClaw’s mutable home directory lives on a PVC, while the chart separates Git-managed workspace bootstrap from runtime-owned sessions, credentials, logs, and generated files.
+- **Monitoring and recovery hooks:** Prometheus/Grafana, Alertmanager integration, Kopia backup jobs, and restore-drill docs are built in rather than bolted on later.
+- **A cleaner path to production-ish homelab use:** SOPS-compatible secret workflows, image build automation, runtime tool bootstrapping, and disaster recovery are treated as first-class concerns from the start.
 
-In short: default OpenClaw is optimized for fast local bring-up; this repo is optimized for running OpenClaw like durable personal infrastructure.
+In short: the upstream Kubernetes docs show the clean minimal deployment; this repo is an opinionated k3s implementation of that pattern, hardened for running OpenClaw like durable personal infrastructure.
 
 ## What this gives you
 
