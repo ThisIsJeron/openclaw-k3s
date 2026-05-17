@@ -4,6 +4,20 @@ A homelab-friendly Kubernetes/GitOps deployment template for running a single Op
 
 This repository is a sanitized public template extracted from a real private deployment. It intentionally ships with safe defaults: no chat channels enabled, no public tunnels enabled, no encrypted live secrets, and no private registry assumptions.
 
+## Why use this instead of the default setup?
+
+The default OpenClaw setup is great for getting started quickly: install it, run it, connect a channel, and iterate. This template is for the next stage — when OpenClaw has become useful enough that you want it to survive restarts, upgrades, host maintenance, and your own future forgetfulness.
+
+Adopting this setup gives you:
+
+- **Reproducibility:** the Gateway deployment, baseline config, runtime tools, and workspace overlay are declared in Git instead of living as one-off host state.
+- **Safer operations:** Argo CD, Helm rendering checks, health probes, rollback scripts, and the GitOps guard make changes more auditable and less “SSH into the box and hope.”
+- **Persistent state:** OpenClaw’s mutable home directory lives on a PVC, so sessions, credentials, workspace files, and runtime state are not tied to a single container lifecycle.
+- **Monitoring and recovery hooks:** Prometheus/Grafana, Alertmanager integration, backup CronJobs, and restore-drill docs are built in rather than bolted on later.
+- **A cleaner path to production-ish homelab use:** secrets, channel config, image builds, and disaster recovery are treated as first-class concerns from the start.
+
+In short: default OpenClaw is optimized for fast local bring-up; this repo is optimized for running OpenClaw like durable personal infrastructure.
+
 ## What this gives you
 
 - Helm chart for OpenClaw Gateway
